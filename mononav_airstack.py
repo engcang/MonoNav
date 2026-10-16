@@ -54,6 +54,10 @@ def fetch_frame(server_url, include_depth=False):
     depth = np.frombuffer(zlib.decompress(depth_payload), dtype="<f4").reshape(
         int(metadata["depth_height"]), int(metadata["depth_width"])
     )
+    if abs(float(metadata['depth_stamp'])-float(metadata['stamp'])) > .15:
+        raise RuntimeError('RGB/GT-depth timestamps differ by more than 0.15 simulation seconds')
+    if depth.shape != bgr.shape[:2]:
+        raise RuntimeError('RGB/GT-depth resolutions do not match')
     return metadata, bgr, depth
 
 
@@ -295,13 +299,16 @@ def transform_execution_primitive(trajectory, camera_pose, point_count=17):
     sample_indices = np.linspace(
         0, len(x_forward) - 1, min(point_count - 1, len(x_forward)), dtype=int
     )
-    # Optical camera coordinates are +Z forward, +X right, +Y down.
-    local_points = np.column_stack(
-        (-y_left[sample_indices], np.zeros(len(sample_indices)), x_forward[sample_indices])
-    )
-    local_points = np.vstack((np.zeros(3), local_points))
-    homogeneous = np.column_stack((local_points, np.ones(len(local_points))))
-    world_points = (camera_pose @ homogeneous.T).T[:, :3]
+    # These are planar control primitives. Camera pitch/roll belongs in TSDF
+    # projection, but must not turn a forward command into a descent command.
+    # Keep height fixed and rotate forward/left using horizontal camera heading.
+    forward = np.asarray(camera_pose[:2,2], dtype=np.float64)
+    forward = forward / max(np.linalg.norm(forward), 1e-9)
+    left = np.asarray([-forward[1], forward[0]])
+    x = np.concatenate(([0.0],x_forward[sample_indices]))
+    y = np.concatenate(([0.0],y_left[sample_indices]))
+    xy = camera_pose[:2,3] + x[:,None]*forward + y[:,None]*left
+    world_points = np.column_stack((xy,np.full(len(xy),camera_pose[2,3])))
     delta = np.diff(world_points[:, :2], axis=0)
     yaw = np.arctan2(delta[:, 1], delta[:, 0])
     yaw = np.concatenate((yaw, yaw[-1:]))
@@ -349,6 +356,9 @@ def create_visualizer():
 
 
 def update_open3d(visualizer, state, vbg, weight_threshold, trajectory_lines):
+    if vbg.hashmap().size() == 0:
+        if state is not None:state['preview_points']=np.empty((0,3))
+        return 0
     point_cloud = vbg.extract_point_cloud(weight_threshold).cpu().to_legacy()
     point_count = len(point_cloud.points)
     if os.environ.get('WS2_INFERENCE_DIR') and state is not None:
@@ -471,6 +481,7 @@ def main():
         help="fuse and visualize immediately, but wait for S/Space in an OpenCV window before flight",
     )
     parser.add_argument("--goal-distance", type=float, default=8.0)
+    parser.add_argument('--mission-goals',help='Explicit task goals as JSON [[forward,left],...], metres in initial horizontal camera frame; not obstacle geometry')
     parser.add_argument('--goal-radius',type=float,default=None,help='Override configured goal completion radius (metres)')
     parser.add_argument("--velocity", type=float, default=0.4)
     parser.add_argument(
@@ -547,6 +558,12 @@ def main():
         ),
     )
     args = parser.parse_args()
+    mission_offsets=json.loads(args.mission_goals) if args.mission_goals else None
+    if mission_offsets is not None:
+        offsets=np.asarray(mission_offsets,dtype=float)
+        if offsets.ndim!=2 or offsets.shape[1]!=2 or not 1<=len(offsets)<=100 or not np.isfinite(offsets).all():
+            parser.error('--mission-goals must contain finite 2D task goals')
+    mission_goals=None;mission_goal_index=0
     if args.headless and args.wait_for_start:
         parser.error('--wait-for-start requires a GUI')
 
@@ -566,13 +583,20 @@ def main():
     else:
         print("Using Isaac Sim ground-truth metric depth (ZoeDepth bypassed)")
 
-    settings = config["VoxelBlockGrid"]
+    settings = dict(config["VoxelBlockGrid"])
+    # Avoid allocating far-away blocks only to erase them after fusion. This
+    # matches integration range to the retained local map and bounds memory
+    # during long turns; it does not clear nearby obstacle history.
+    settings['depth_max'] = min(settings['depth_max'], args.tsdf_local_radius)
     def make_vbg_wrapper():
         return VoxelBlockGrid(
             settings["depth_scale"],
             settings["depth_max"],
             settings["trunc_voxel_multiplier"],
             o3d.core.Device(settings["device"]),
+            # A voxel per hash block creates excessive hash/scratch allocation
+            # on longer flights. Dense 8^3 blocks retain the same TSDF method.
+            voxel_size=0.06, block_resolution=8, block_count=4000,
         )
 
     vbg_wrapper = make_vbg_wrapper()
@@ -627,6 +651,12 @@ def main():
 
     try:
         while True:
+            # The bench owns shutdown/landing after a terminal frame. Keep the
+            # process alive for its GT evaluator, but do not keep growing TSDF
+            # or allocating point clouds while the already-finished flight lands.
+            if mission_complete and args.headless and os.environ.get('WS2_RUN_ID'):
+                time.sleep(0.1)
+                continue
             loop_start = time.monotonic()
             try:
                 if args.depth_source == "ground-truth":
@@ -654,9 +684,19 @@ def main():
             if goal_position is None:
                 camera_goal = np.array([0.0, 0.0, args.goal_distance, 1.0])
                 goal_position = (pose @ camera_goal)[:3].reshape(1, 3)
+                if mission_offsets is not None:
+                    forward=pose[:2,2]/np.linalg.norm(pose[:2,2]);left=np.array([-forward[1],forward[0]])
+                    mission_goals=np.array([[*(pose[:2,3]+forward*x+left*y),pose[2,3]] for x,y in mission_offsets])
+                    goal_position=mission_goals[0:1]
+                    print('Explicit mission goals: '+json.dumps(mission_goals.tolist()))
                 initial_camera_altitude = float(pose[2, 3])
                 print(f"World-frame goal initialized at {goal_position[0].round(3).tolist()}")
             distance_to_goal = float(np.linalg.norm(pose[:3, 3] - goal_position[0]))
+            if mission_goals is not None:
+                while mission_goal_index<len(mission_goals)-1 and distance_to_goal<=1.2:
+                    mission_goal_index+=1;goal_position=mission_goals[mission_goal_index:mission_goal_index+1]
+                    distance_to_goal=float(np.linalg.norm(pose[:3,3]-goal_position[0]))
+                    print(f'Mission goal advanced: {mission_goal_index+1}/{len(mission_goals)}',flush=True)
             if flight_started and distance_to_goal <= float(config["min_dist2goal"]):
                 mission_complete = True
                 stop_reason = "goal threshold reached"
@@ -990,9 +1030,12 @@ def main():
                     temp=directory/'mononav.jpg.tmp';temp.write_bytes(encoded.tobytes());temp.replace(directory/'mononav.jpg')
                     info={'planner':'mononav','run_id':os.environ.get('WS2_RUN_ID'),'wall_time':time.time(),
                           'sequence':int(metadata['sequence']),'sim_stamp':metadata['stamp'],
+                          'depth_stamp':metadata.get('depth_stamp'),
                           'inference_ms':inference_seconds*1000,'primitive':int(selected_index),
                           'goal_distance':float(distance_to_goal),'tsdf_points':int(point_count),
-                          'blocked':bool(should_stop),'depth_source':args.depth_source}
+                          'blocked':bool(should_stop),'recovery_mode':str(recovery_mode),
+                          'depth_summary_m':{'p10':float(np.percentile(depth_mm,10)/1000.),'median':float(np.median(depth_mm)/1000.),'p90':float(np.percentile(depth_mm,90)/1000.)},
+                          'depth_source':args.depth_source}
                     temp=directory/'mononav.json.tmp';temp.write_text(json.dumps(info));temp.replace(directory/'mononav.json')
             key = -1 if args.headless else cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
@@ -1007,9 +1050,11 @@ def main():
                 last_recovery_command_time = 0.0
                 active_primitive_index = None
                 flight_started = True
-                goal_position = (pose @ np.array([0.0, 0.0, args.goal_distance, 1.0]))[:3].reshape(1, 3)
+                goal_position = None
+                mission_goals = None
+                mission_goal_index = 0
                 initial_camera_altitude = float(pose[2, 3])
-                print(f"START GATE OPEN: flight enabled; goal={goal_position[0].round(3).tolist()}")
+                print("START GATE OPEN: flight enabled; task goals will initialize on the next frame")
             elif args.execute and flight_started and key == ord("p"):
                 print(f"MANUAL PAUSE: {post_pause(args.server)}")
                 flight_started = False

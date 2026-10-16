@@ -37,16 +37,17 @@ You can read more about the VoxelBlockGrid here:
 https://www.open3d.org/docs/latest/tutorial/t_reconstruction_system/voxel_block_grid.html
 """
 class VoxelBlockGrid:
-    def __init__(self, depth_scale=1000.0, depth_max=5.0, trunc_voxel_multiplier=8.0, device=o3d.core.Device("CUDA:0")):
+    def __init__(self, depth_scale=1000.0, depth_max=5.0, trunc_voxel_multiplier=8.0, device=o3d.core.Device("CUDA:0"),
+                 voxel_size=3.0/64, block_resolution=1, block_count=50000):
         # Reconstruction Information
-        self.depth_scale = depth_scale
-        self.depth_max = depth_max
-        self.trunc_voxel_multiplier = trunc_voxel_multiplier
+        self.depth_scale = float(depth_scale)
+        self.depth_max = float(depth_max)
+        self.trunc_voxel_multiplier = float(trunc_voxel_multiplier)
         self.device = device
         self.camera = o3d.camera.PinholeCameraIntrinsic(o3d.camera.PinholeCameraIntrinsicParameters.PrimeSenseDefault) # Kinect Intrinsics (default)
         self.depth_intrinsic = o3d.core.Tensor(self.camera.intrinsic_matrix, o3d.core.Dtype.Float64)
-        self.voxel_size = 3.0 / 64
-        self.block_resolution = 1
+        self.voxel_size = float(voxel_size)
+        self.block_resolution = int(block_resolution)
 
         # Initialize the VoxelBlockGrid
         self.vbg = o3d.t.geometry.VoxelBlockGrid(
@@ -55,12 +56,17 @@ class VoxelBlockGrid:
             attr_channels=(1, 1, 3),
             voxel_size=self.voxel_size, # this sets the resolution of the voxel grid
             block_resolution=self.block_resolution,
-            block_count=50000,
+            block_count=int(block_count),
             device=device)
 
     def integration_step(self, color, depth_numpy, cam_pose):
         # Integration Step (TSDF Fusion)
         depth_numpy = depth_numpy.astype(np.uint16)  # Convert to uint16
+        # An empty / out-of-range frame contains no surface to integrate.
+        # Open3D raises before returning an empty block set in this case.
+        # Preserve the existing map; do not convert missing depth into free space.
+        if not np.any((depth_numpy > 0) & (depth_numpy < self.depth_max*self.depth_scale)):
+            return False
         depth = o3d.t.geometry.Image(depth_numpy).to(self.device)
         extrinsic = o3d.core.Tensor(np.linalg.inv(cam_pose), o3d.core.Dtype.Float64)
         frustum_block_coords = self.vbg.compute_unique_block_coordinates(
@@ -69,6 +75,7 @@ class VoxelBlockGrid:
         color_intrinsic = o3d.core.Tensor(self.camera.intrinsic_matrix, o3d.core.Dtype.Float64)
         self.vbg.integrate(frustum_block_coords, depth, color, self.depth_intrinsic,
                        color_intrinsic, extrinsic, self.depth_scale, self.depth_max, self.trunc_voxel_multiplier)
+        return True
 
     def prune_outside_radius(self, center, radius):
         """Remove voxel blocks outside a local 3D radius to bound GPU memory."""

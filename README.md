@@ -1,185 +1,70 @@
-# MonoNav: MAV Navigation via Monocular<br>Depth Estimation and Reconstruction
+# MonoNav with AirStack
 
-Original repo: [natesimon/MonoNav](https://github.com/natesimon/MonoNav)
+RGB → ZoeDepth → TSDF → motion primitives. Based on
+[natesimon/MonoNav](https://github.com/natesimon/MonoNav).
+The AirStack worker adds the HTTP interface and flight-control integration;
+network weights are not retrained.
 
-## AirStack online demo
+## Installation
 
-For unattended bench execution, `mononav_airstack.py --headless --execute`
-runs without OpenCV/Open3D windows. Do not combine `--headless` with
-`--wait-for-start`. `--goal-radius` overrides the configured completion radius
-so the worker and external evaluator can use the same mission definition.
-Each isolated trial starts a new worker to reset TSDF and recovery state.
-
-Optional `WS2_INFERENCE_DIR` exports the actual RGB/depth, TSDF projection and
-candidate/selected primitives as `mononav.jpg` plus `mononav.json`, including
-in headless mode. Mount a writable directory there and set `WS2_RUN_ID` to the
-trial identifier. The AirStack bench does this automatically for its web monitor.
-Only the most recent frame is retained; this does not record a video.
-
-This fork runs the MonoNav perception and motion-primitive planner online with an
-AirStack Iris in NVIDIA Isaac Sim. AirStack publishes the simulated left RGB image,
-camera intrinsics, and ground-truth optical-camera pose through a small ROS 2/HTTP
-bridge. This repository runs ZoeDepth, Open3D TSDF fusion, and MonoNav planning in a
-separate GPU container, then returns the selected primitive to AirStack as a trajectory.
-
-The separate containers are intentional. AirStack uses ROS 2 Jazzy, while the original
-MonoNav stack requires an older Python/CUDA environment. The supplied MonoNav image is
-based on PyTorch 1.13.1, CUDA 11.6, Open3D 0.18.0, OpenCV 4.6.0.66, NumPy 1.24.1,
-SciPy 1.10.0, and timm 0.6.12. ZoeDepth is pinned as a Git submodule at `edb6daf`.
-
-The integration preserves the MonoNav core: monocular ZoeDepth inference, Open3D TSDF
-fusion, and goal-directed collision checking over motion primitives. Integration-only
-additions are the AirStack bridge, simulator-depth A/B mode, start/pause gate, a local
-sliding TSDF window, conservative synthetic-depth speckle filtering, trajectory command
-holds, and yaw-scan recovery. It is therefore best described as **MonoNav integrated
-with AirStack**, not a bit-for-bit reproduction of the original flight stack.
-
-### Requirements
-
-- Ubuntu with an NVIDIA GPU and a driver compatible with CUDA 11.6 and Isaac Sim
-- Docker Engine, Docker Compose, and NVIDIA Container Toolkit
-- A graphical X11 desktop (`DISPLAY` and `~/.Xauthority` available)
-- Access to `github.com/castacks` and the CMU AirLab Docker registry
-- At least 25 GB of free disk space for the AirStack images
-
-### Installation
-
-Clone AirStack and this fork as sibling directories. Recursive clone is required for
-both PegasusSimulator and ZoeDepth.
+Use Linux, Docker, NVIDIA Container Toolkit and the AirStack Isaac/PX4 setup.
+Keep `AirStack/` and `MonoNav/` beside each other.
 
 ```bash
-mkdir dsta_ws
-cd dsta_ws
-git clone --recursive -b eungchang/adv-ws2 git@github.com:castacks/AirStack.git
-git clone --recursive https://github.com/engcang/MonoNav.git
-```
-
-Set up AirStack and obtain its images. Skip `install` when Docker and NVIDIA Container
-Toolkit are already configured.
-
-```bash
-cd AirStack
-./airstack.sh install       # optional on an already configured host
-./airstack.sh setup
-docker login airlab-docker.andrew.cmu.edu
-./airstack.sh image-pull
-```
-
-Build the MonoNav GPU image from the checked-in Dockerfile. No pre-existing local image
-is assumed.
-
-```bash
-cd ../MonoNav
+git clone --recursive --branch eungchang/adv-ws2 git@github.com:castacks/AirStack.git
+git clone --recursive git@github.com:engcang/MonoNav.git
+cd MonoNav
 ./docker/build_image.sh
 ```
 
-### Run the online demo
+Follow `AirStack/tools/ws2_bench/README.md` to prepare the simulator/robot
+containers and bridge. ZoeDepth downloads its pretrained weights on first use;
+the bench retains them in Docker volume `mononav-torch-cache`. Do not commit
+that cache or generated experiment data.
 
-Open three terminals in the same graphical desktop session.
+## Run
 
-Terminal 1 — start only Isaac Sim and the desktop robot stack. This avoids starting the
-GCS/Foxglove service. The deterministic demo scene is an empty Isaac room with three
-colored slalom obstacles, and the RTX lidar is disabled because MonoNav does not use it.
-
-```bash
-cd dsta_ws/AirStack
-PLAY_SIM_ON_START=true \
-ISAAC_SIM_ENVIRONMENT='Default Environment' \
-MONONAV_DEMO_OBSTACLES=true \
-DRONE_INIT_X=0.0 \
-DRONE_INIT_Y=0.0 \
-DRONE_INIT_Z=0.30 \
-ENABLE_LIDAR=false \
-./airstack.sh up isaac-sim robot-desktop
-```
-
-Wait for the ROS workspace build and AirStack bringup to finish. After the front camera
-and odometry begin updating, send the AirStack takeoff action and wait for a successful
-result before starting the bridge:
+From `AirStack/`, open the viewer in one terminal and run a scenario in another:
 
 ```bash
-docker exec -it airstack-robot-desktop-1 bash -lc \
-  'sws && ros2 action send_goal --feedback \
-  /robot_1/tasks/takeoff \
-  task_msgs/action/TakeoffTask \
-  "{target_altitude_m: 1.2, velocity_m_s: 0.3}"'
+source .venv-ws2/bin/activate
+python3 tools/ws2_bench/dashboard.py --port 8892
+python3 tools/ws2_bench/episode.py tools/ws2_bench/scenarios/corridor_mononav.yaml \
+  --no-bag --camera follow --record-video
 ```
 
-Terminal 2 — launch the bridge with trajectory execution enabled:
+View `http://127.0.0.1:8892`. The bench handles takeoff, worker startup,
+execution, evaluation and landing. MP4 recording needs `ffmpeg` or the
+`imageio-ffmpeg` Python package. Omit `--no-bag` to also record a ROS bag.
+Only one executing planner may use the bridge at a time.
+
+For the common maps and recorded clean/attack suite:
 
 ```bash
-docker exec -it airstack-robot-desktop-1 bash -lc \
-  'sws && ros2 launch mononav_bridge mononav_bridge.launch.xml \
-  mononav_bridge_max_frame_rate:=3.0 \
-  mononav_bridge_execute_commands:=true'
+python3 tools/ws2_bench/corridor_suite.py --targets mononav --tiers easy \
+  --output robot/ros_ws/ws2_runtime/campaigns/mononav_recorded
 ```
 
-The legacy MonoNav bridge rate above is independent of the generic vision-planner
-bridge used by Collision-avoidance. MonoNav still requests frames at `1.0` Hz below.
+This runs clean checks before sensor attacks. A completed result in the same
+output directory is reused on resume, not rerun. Change the output directory
+when changing settings. The viewer's Start tests form runs Office campaigns;
+corridor suites start through the CLI above.
 
-Terminal 3 — start the MonoNav worker:
+## Configuration
 
-```bash
-cd dsta_ws/MonoNav
-MONONAV_EXECUTE=true ./docker/run_airstack_live.sh \
-  --depth-source zoe \
-  --zoe-depth-scale 1.68 \
-  --wait-for-start \
-  --rate 1.0 \
-  --warmup-frames 6 \
-  --min-tsdf-points 1000 \
-  --velocity 0.4 \
-  --goal-distance 8.0 \
-  --min-dist2obs 0.6 \
-  --planning-height-band 0.30 \
-  --clearance-recovery-distance 0.25 \
-  --max-altitude-deviation 0.6 \
-  --stop-confirm-frames 3 \
-  --command-hold-seconds 1.25 \
-  --recovery-hold-seconds 2.5 \
-  --tsdf-block-warning 80000
-```
+- `AirStack/tools/ws2_bench/scenarios/corridor_mononav.yaml`: target settings,
+  including `velocity`, `zoe_depth_scale`, `minimum_planning_clearance`,
+  `tsdf_local_radius`, altitude and timeout.
+- `AirStack/tools/ws2_bench/scenarios/corridor_suite.yaml`: shared corridor
+  scale/width, lighting, sensor noise/delay and observer camera. The suite
+  replaces each target YAML's scene with this common map.
+- `config.yml`: underlying ZoeDepth/MonoNav parameters and primitive library.
+- Standalone worker options: `python mononav_airstack.py --help` inside the
+  `mononav-demo:1.0` image. `--headless --execute` is the unattended mode;
+  `--wait-for-start` is only for the interactive GUI.
 
-Arrange the Isaac Sim, RViz, RGB, depth, and Open3D windows before flight. Wait until the
-RGB overlay shows `map_ready=True` (at least 1000 TSDF points), focus either OpenCV RGB
-or depth window, and press `S` or `Space` to set an 8 m goal in the camera's current
-forward direction and enable commands. Press `P` to pause and hover; press `Q` or `Esc`
-to stop the worker. The Open3D window supports left-drag rotation, Ctrl+left-drag pan,
-mouse-wheel zoom, and `R` to reset to its Z-up view.
-
-To compare the same integration against metric simulator depth, replace the first two
-worker options with:
-
-```bash
---depth-source ground-truth --min-tsdf-points 0
-```
-
-The Zoe scale `1.68` is an empirical calibration for this simulated ZED image path. It
-is not caused solely by image downsampling and is not universal: FOV/intrinsics,
-content, and synthetic-to-real domain shift all affect monocular metric scale. Refit it
-after changing the camera pipeline, scene domain, or depth model.
-
-### Shutdown
-
-Stop the MonoNav worker and bridge with `Ctrl+C`, then remove the AirStack containers:
-
-```bash
-cd dsta_ws/AirStack
-./airstack.sh down
-```
-
-### Main demo parameters
-
-- `--rate`: maximum planning/fusion loop rate in Hz; ZoeDepth inference may be slower.
-- `--warmup-frames`: frames fused before the planner is allowed to select commands.
-- `--velocity`: commanded speed along a one-second primitive in m/s.
-- `--goal-distance`: forward distance from the pose at which the start key is pressed.
-- `--min-dist2obs`: required primitive clearance from reconstructed obstacles in metres.
-- `--command-hold-seconds`: minimum time a selected primitive remains active before
-  replanning can replace it.
-- `--tsdf-local-radius`: radius of the spatial sliding map; old blocks are pruned
-  gradually rather than clearing the complete TSDF.
-
-The AirStack profile contains 13 gentler primitives at 0.4 m/s in
-`utils/trajlib_airstack`. The original seven-primitive library in `utils/trajlib` is not
-modified.
+The corridor bench supplies explicit corner task goals; MonoNav computes its
+own avoidance path. Kim/PULP have different task interfaces and receive no
+route goals. `--depth-source ground-truth` is a privileged diagnostic, not
+normal RGB operation. Rui's FCRN patch is not supported on ZoeDepth.
+Actual flight evidence is in AirStack `tools/ws2_bench/CORRIDOR_VALIDATION.md`.
